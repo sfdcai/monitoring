@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Datadog Agent Installation Script for Multiple Systems
+# Detects system based on OS and installs/configures accordingly
 # Prompts for API Key at runtime for secure GitHub hosting
 # Datadog Site: datadoghq.com
 # Date: April 22, 2025
@@ -9,16 +10,6 @@
 # Configuration
 DATADOG_SITE="datadoghq.com"
 LOG_FILE="/tmp/datadog_install_$(date +%F_%H-%M-%S).log"
-
-# System-specific configurations
-HOSTNAMES=(
-  "router"        # OpenWRT, 192.168.1.1
-  "proxmox"       # Proxmox, 192.168.1.2
-  "adguard-home"  # AdGuard Home, Alpine LXC, 192.168.1.3
-  "docker-host"   # Docker Host, Alpine LXC, 192.168.1.9
-  "home-assistant" # Home Assistant, HA OS, 192.168.1.10
-  "jellyfin"      # Jellyfin, Ubuntu LXC, 192.168.1.11
-)
 
 # Function to log messages
 log() {
@@ -86,10 +77,8 @@ check_placeholders() {
   fi
 }
 
-# Function to detect system type
+# Function to detect system type based on OS
 detect_system() {
-  local hostname
-  hostname=$(hostname)
   if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$ID
@@ -102,49 +91,56 @@ detect_system() {
     exit 1
   fi
 
-  case "$hostname" in
-    "router")
+  case "$OS" in
+    "openwrt")
       SYSTEM="router"
       ;;
-    "proxmox")
+    "debian")
       SYSTEM="proxmox"
       ;;
-    "adguard-home")
-      SYSTEM="adguard"
+    "alpine")
+      SYSTEM="alpine"
+      # Prompt user to specify if this is the Docker Host
+      echo "Is this the Docker Host system? (y/n)"
+      read -r is_docker
+      if [ "$is_docker" = "y" ] || [ "$is_docker" = "Y" ]; then
+        IS_DOCKER_HOST="true"
+        SYSTEM_NAME="docker-host"
+      else
+        IS_DOCKER_HOST="false"
+        SYSTEM_NAME="adguard-home"
+      fi
       ;;
-    "docker-host")
-      SYSTEM="docker-host"
-      ;;
-    "home-assistant")
+    "hassio")
       SYSTEM="home-assistant"
       ;;
-    "jellyfin")
+    "ubuntu")
       SYSTEM="jellyfin"
       ;;
     *)
-      log "ERROR: Unknown hostname $hostname. Expected one of: ${HOSTNAMES[*]}"
+      log "ERROR: Unsupported operating system: $OS"
       exit 1
       ;;
   esac
-  log "Detected system: $SYSTEM (OS: $OS, Hostname: $hostname)"
+  log "Detected system: $SYSTEM (OS: $OS${SYSTEM_NAME:+, Name: $SYSTEM_NAME})"
 }
 
 # Function to configure Datadog alerts
 configure_alerts() {
-  local hostname=$1
+  local system_name=$1
   local alert_type=$2
   local metric=$3
   local threshold=$4
-  local message="Alert: $alert_type on $hostname"
+  local message="Alert: $alert_type on $system_name"
 
   local api_url="https://api.datadoghq.com/api/v1/monitor"
-  local query="avg(last_5m):avg:$metric{host:$hostname} $threshold"
+  local query="avg(last_5m):avg:$metric{host:$system_name} $threshold"
 
   cat > /tmp/monitor.json <<EOF
 {
   "type": "metric alert",
   "query": "$query",
-  "name": "$alert_type on $hostname",
+  "name": "$alert_type on $system_name",
   "message": "$message",
   "tags": ["env:home"],
   "priority": 3,
@@ -172,9 +168,9 @@ EOF
     -H "DD-API-KEY: $API_KEY" \
     -d @/tmp/monitor.json)
   if command -v jq >/dev/null && echo "$response" | jq -e '.id' >/dev/null; then
-    log "Alert configured: $alert_type for $hostname"
+    log "Alert configured: $alert_type for $system_name"
   else
-    log "ERROR: Failed to configure alert for $hostname: $response"
+    log "ERROR: Failed to configure alert for $system_name: $response"
   fi
   rm -f /tmp/monitor.json
 }
@@ -272,7 +268,7 @@ instances:
       - MIB: IP-MIB
         symbols:
           - ipInReceives
-          - ipOutRequestsAdministration
+          - ipOutRequests
 EOF
 
   datadog-agent integration install -t datadog-proxmox==1.0.0 >>"$LOG_FILE" 2>&1
@@ -306,9 +302,9 @@ EOF
 
 # Function to install on Alpine-based systems (AdGuard, Docker Host)
 install_alpine() {
-  local hostname=$1
-  local is_docker_host=$2
-  log "Installing Datadog Agent on Alpine ($hostname)"
+  local is_docker_host=$1
+  local system_name=$2
+  log "Installing Datadog Agent on Alpine ($system_name)"
 
   if ! command -v apk >/dev/null; then
     log "ERROR: apk not found, is this Alpine?"
@@ -316,9 +312,10 @@ install_alpine() {
   fi
   check_disk_space "/opt" 200
 
-  apk add curl jq >>"$LOG_FILE" 2>&1
+  # Install bash to ensure script compatibility
+  apk add bash curl jq >>"$LOG_FILE" 2>&1
   if [ $? -ne 0 ]; then
-    log "ERROR: Failed to install curl and jq"
+    log "ERROR: Failed to install bash, curl, and jq"
     exit 1
   fi
 
@@ -334,7 +331,7 @@ install_alpine() {
   cat > /etc/datadog-agent/datadog.yaml <<EOF
 api_key: $API_KEY
 site: $DATADOG_SITE
-hostname: $hostname
+hostname: $system_name
 apm_config:
   enabled: true
   max_traces_per_second: 10
@@ -353,13 +350,13 @@ depend() {
 EOF
   chmod +x /etc/init.d/datadog-agent
   rc-update add datadog-agent default
-  rc-service datacog-agent start >>"$LOG_FILE" 2>&1
+  rc-service datadog-agent start >>"$LOG_FILE" 2>&1
   if [ $? -ne 0 ]; then
     log "ERROR: Failed to start Datadog Agent"
     exit 1
   fi
 
-  if [ "$hostname" = "adguard-home" ]; then
+  if [ "$is_docker_host" = "false" ]; then
     mkdir -p /etc/datadog-agent/conf.d/adguard.d
     cat > /etc/datadog-agent/conf.d/adguard.d/conf.yaml <<EOF
 logs:
@@ -480,7 +477,7 @@ EOF
     configure_alerts "docker-host" "High Memory" "docker.mem.rss" "> 1000000000"
   fi
 
-  log "Alpine ($hostname) installation complete"
+  log "Alpine ($system_name) installation complete"
 }
 
 # Function to install on Home Assistant OS
@@ -618,11 +615,8 @@ case $SYSTEM in
   "proxmox")
     install_proxmox
     ;;
-  "adguard")
-    install_alpine "adguard-home" "false"
-    ;;
-  "docker-host")
-    install_alpine "docker-host" "true"
+  "alpine")
+    install_alpine "$IS_DOCKER_HOST" "$SYSTEM_NAME"
     ;;
   "home-assistant")
     install_home_assistant
