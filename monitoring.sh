@@ -49,12 +49,17 @@ check_disk_space() {
   local path=$1
   local min_space_mb=$2
   local available_space
-  available_space=$(df -m "$path" | tail -1 | awk '{print $4}')
+  # Use df -m and adjust awk to handle Alpine's df output (available space in 4th column, or 5th if % is present)
+  available_space=$(df -m "$path" | tail -1 | awk '{print $(NF-2)}' | grep -o '[0-9]*')
+  if [ -z "$available_space" ]; then
+    log "ERROR: Unable to determine available disk space on $path"
+    exit 1
+  fi
   if [ "$available_space" -lt "$min_space_mb" ]; then
     log "ERROR: Insufficient disk space on $path (available: ${available_space}MB, required: ${min_space_mb}MB)"
     exit 1
   fi
-  log "Sufficient disk space on $path"
+  log "Sufficient disk space on $path (${available_space}MB available)"
 }
 
 # Function to validate log file paths
@@ -94,9 +99,11 @@ detect_system() {
   case "$OS" in
     "openwrt")
       SYSTEM="router"
+      SYSTEM_NAME="router"
       ;;
     "debian")
       SYSTEM="proxmox"
+      SYSTEM_NAME="proxmox"
       ;;
     "alpine")
       SYSTEM="alpine"
@@ -113,16 +120,18 @@ detect_system() {
       ;;
     "hassio")
       SYSTEM="home-assistant"
+      SYSTEM_NAME="home-assistant"
       ;;
     "ubuntu")
       SYSTEM="jellyfin"
+      SYSTEM_NAME="jellyfin"
       ;;
     *)
       log "ERROR: Unsupported operating system: $OS"
       exit 1
       ;;
   esac
-  log "Detected system: $SYSTEM (OS: $OS${SYSTEM_NAME:+, Name: $SYSTEM_NAME})"
+  log "Detected system: $SYSTEM (OS: $OS, Name: $SYSTEM_NAME)"
 }
 
 # Function to configure Datadog alerts
@@ -311,22 +320,45 @@ install_alpine() {
     exit 1
   fi
   check_disk_space "/opt" 200
+  check_disk_space "/tmp" 200
 
-  # Install bash to ensure script compatibility
+  # Install bash, curl, and jq
   apk add bash curl jq >>"$LOG_FILE" 2>&1
   if [ $? -ne 0 ]; then
     log "ERROR: Failed to install bash, curl, and jq"
     exit 1
   fi
 
-  curl -L https://s3.amazonaws.com/dd-agent/binaries/datadog-agent-latest.amd64-linux.tar.gz -o /tmp/datadog-agent.tar.gz >>"$LOG_FILE" 2>&1
-  if [ $? -ne 0 ]; then
-    log "ERROR: Failed to download Datadog Agent"
+  # Download agent with validation
+  local agent_url="https://s3.amazonaws.com/dd-agent/binaries/datadog-agent-latest.amd64-linux.tar.gz"
+  curl -L "$agent_url" -o /tmp/datadog-agent.tar.gz >>"$LOG_FILE" 2>&1
+  if [ $? -ne 0 ] || [ ! -s /tmp/datadog-agent.tar.gz ]; then
+    log "ERROR: Failed to download Datadog Agent from $agent_url"
     exit 1
   fi
+
+  # Extract agent
   tar -xzf /tmp/datadog-agent.tar.gz -C /opt >>"$LOG_FILE" 2>&1
-  mv /opt/datadog-agent-* /opt/datadog-agent
+  if [ $? -ne 0 ]; then
+    log "ERROR: Failed to extract Datadog Agent to /opt"
+    exit 1
+  fi
+
+  # Find extracted directory
+  local agent_dir
+  agent_dir=$(ls -d /opt/datadog-agent-* 2>/dev/null)
+  if [ -z "$agent_dir" ]; then
+    log "ERROR: No datadog-agent directory found in /opt after extraction"
+    exit 1
+  fi
+  mv "$agent_dir" /opt/datadog-agent >>"$LOG_FILE" 2>&1
+  if [ $? -ne 0 ]; then
+    log "ERROR: Failed to rename $agent_dir to /opt/datadog-agent"
+    exit 1
+  fi
   rm /tmp/datadog-agent.tar.gz
+
+  # Configure agent
   mkdir -p /etc/datadog-agent
   cat > /etc/datadog-agent/datadog.yaml <<EOF
 api_key: $API_KEY
@@ -338,6 +370,7 @@ apm_config:
 logs_enabled: true
 EOF
 
+  # Set up service
   cat > /etc/init.d/datadog-agent <<EOF
 #!/sbin/openrc-run
 name="datadog-agent"
@@ -352,7 +385,7 @@ EOF
   rc-update add datadog-agent default
   rc-service datadog-agent start >>"$LOG_FILE" 2>&1
   if [ $? -ne 0 ]; then
-    log "ERROR: Failed to start Datadog Agent"
+    log "ERROR: Failed to start Datadog Agent. Check /opt/datadog-agent/logs/ for details"
     exit 1
   fi
 
@@ -381,6 +414,10 @@ instances:
       - env:home
 EOF
     rc-service datadog-agent restart >>"$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+      log "ERROR: Failed to restart Datadog Agent after AdGuard configuration"
+      exit 1
+    fi
     configure_alerts "adguard-home" "High Blocked Queries" "adguard.blocked_queries" "> 1000"
     configure_alerts "adguard-home" "Agent Failure" "datadog.agent.check_status" "> 0"
   fi
@@ -425,6 +462,10 @@ logs:
       - env:home
 EOF
     rc-service datadog-agent restart >>"$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+      log "ERROR: Failed to restart Datadog Agent after Docker configuration"
+      exit 1
+    fi
 
     if [ -f "/docker-compose.yml" ]; then
       cp /docker-compose.yml /docker-compose.yml.bak
@@ -662,5 +703,5 @@ log "Setup complete. Check $LOG_FILE for details."
 log "Next steps:"
 log "- Replace placeholders (e.g., REPLACE_WITH_YOUR_PASSWORD, REPLACE_WITH_YOUR_HA_TOKEN)"
 log "- Verify metrics in Datadog UI: https://app.datadoghq.com/metric/explorer"
-log "- Check logs in /var/log/datadog/ (Debian/Ubuntu) or Docker logs (Home Assistant)"
+log "- Check logs in /var/log/datadog/ (Debian/Ubuntu) or /opt/datadog-agent/logs/ (Alpine) or Docker logs (Home Assistant)"
 log "- For APM, instrument applications (see https://docs.datadoghq.com/tracing/setup_overview/)"
